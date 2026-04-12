@@ -28,7 +28,7 @@ find_path(FFMPEG_INCLUDE_DIR
 )
 
 # Ищем каждую библиотеку отдельно
-foreach(_lib avcodec avformat avutil)
+foreach(_lib avcodec avformat avutil swscale)
     string(TOUPPER ${_lib} _LIB_UPPER)
     find_library(FFMPEG_${_LIB_UPPER}_LIBRARY
         NAMES ${_lib}
@@ -81,6 +81,8 @@ set(SOURCES
     inputcontroller.cpp
     zoompanstate.cpp
     osd.cpp
+    transportpanel.cpp
+    thumbnailgenerator.cpp
 )
 
 set(HEADERS
@@ -93,6 +95,8 @@ set(HEADERS
     inputcontroller.h
     zoompanstate.h
     osd.h
+    transportpanel.h
+    thumbnailgenerator.h
 )
 
 # ── Исполняемый файл ─────────────────────────────────────────────────────────
@@ -115,6 +119,7 @@ target_link_libraries(vScrubber2 PRIVATE
     ${FFMPEG_AVCODEC_LIBRARY}
     ${FFMPEG_AVFORMAT_LIBRARY}
     ${FFMPEG_AVUTIL_LIBRARY}
+    ${FFMPEG_SWSCALE_LIBRARY}
     ${CUDA_LIBRARY}
     ${CUDART_LIBRARY}
     opengl32

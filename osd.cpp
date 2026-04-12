@@ -55,7 +55,7 @@ void OSD::draw(QPainter& painter, int widgetW, int widgetH)
     if (widgetW <= 0) return;
 
     // Шрифт — моноширинный, размер адаптивный
-    int fontSize = std::max(12, widgetW / 80);
+    int fontSize = std::max(9, widgetW / 120);
     QFont font("Consolas", fontSize);
     font.setStyleHint(QFont::Monospace);
     painter.setFont(font);

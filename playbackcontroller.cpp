@@ -39,7 +39,6 @@ void PlaybackController::play()
     // (только при положительной скорости — реверс через seekTo)
     emit continuousPlayChanged(m_speed > 0.0);
 
-    qDebug() << "PlaybackController: play, скорость" << m_speed << "x";
     emit stateChanged(m_state);
 }
 
@@ -52,7 +51,6 @@ void PlaybackController::pause()
 
     emit continuousPlayChanged(false);
 
-    qDebug() << "PlaybackController: пауза";
     emit stateChanged(m_state);
 }
 
@@ -64,7 +62,6 @@ void PlaybackController::stop()
 
     emit continuousPlayChanged(false);
 
-    qDebug() << "PlaybackController: стоп";
     emit stateChanged(m_state);
 }
 
@@ -72,8 +69,8 @@ void PlaybackController::stop()
 
 void PlaybackController::setSpeed(double speed)
 {
-    // Округляем до 0.1 чтобы избежать плавающих ошибок
-    double newSpeed = std::round(speed * 10.0) / 10.0;
+    // Округляем до 0.2 (шаг скорости)
+    double newSpeed = std::round(speed * 5.0) / 5.0;
 
     // Ограничиваем диапазон: -MAX_SPEED .. +MAX_SPEED, 0 допускается
     newSpeed = std::clamp(newSpeed, -MAX_SPEED, MAX_SPEED);
@@ -93,7 +90,6 @@ void PlaybackController::setSpeed(double speed)
         emit continuousPlayChanged(m_speed > 0.0);
     }
 
-    qDebug() << "PlaybackController: скорость" << m_speed << "x";
     emit speedChanged(m_speed);
 }
 
@@ -112,7 +108,6 @@ void PlaybackController::notifyEndOfFile()
 {
     if (m_state == Playing) {
         pause();
-        qDebug() << "PlaybackController: конец файла, пауза";
     }
 }
 

@@ -36,12 +36,18 @@ private slots:
     void onSpeedChanged(double speed);
     void onPlaybackStateChanged(int state);
     void onSeekKeyframe(int direction);
+    void onEndOfFile();
 
 private:
     void setupMenu();
     void updateTitle();
+    void openFileKeepState(const QString& path);  // открытие с сохранением режима
 
     VideoWidget*        m_videoWidget = nullptr;
     PlaybackController* m_playback    = nullptr;
     InputController*    m_input       = nullptr;
+
+    // Отложенное восстановление play после загрузки файла
+    double m_pendingSpeed = 1.0;
+    bool   m_pendingPlay  = false;
 };

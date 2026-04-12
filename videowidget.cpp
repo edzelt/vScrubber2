@@ -1,5 +1,6 @@
 #include "videowidget.h"
 #include "inputcontroller.h"
+#include "transportpanel.h"
 #include <QDebug>
 #include <QKeyEvent>
 #include <QMouseEvent>
@@ -14,7 +15,15 @@ VideoWidget::VideoWidget(QWidget* parent)
 {
     setFocusPolicy(Qt::StrongFocus);
     setAttribute(Qt::WA_OpaquePaintEvent);
-    setMouseTracking(true);  // для pan при зажатой ЛКМ
+    setMouseTracking(true);
+
+    // Панель управления (child widget поверх OpenGL)
+    m_transport = new TransportPanel(this);
+
+    // Генератор превью (фоновый поток)
+    m_thumbGen = std::make_unique<ThumbnailGenerator>();
+    m_thumbGen->start(QThread::LowPriority);
+    m_transport->setThumbnailGenerator(m_thumbGen.get());
 }
 
 VideoWidget::~VideoWidget()
@@ -59,10 +68,11 @@ void VideoWidget::initializeGL()
             this, &VideoWidget::onNextDecoded, Qt::QueuedConnection);
     connect(m_decoder.get(), &FFmpegDecoder::prefetchGopDecoded,
             this, &VideoWidget::onPrefetchGopDecoded, Qt::QueuedConnection);
+    connect(m_decoder.get(), &FFmpegDecoder::endOfStream,
+            this, &VideoWidget::onEndOfStream, Qt::QueuedConnection);
 
     m_decoder->start(QThread::HighPriority);
     m_initialized = true;
-    qDebug() << "VideoWidget: инициализация завершена";
 }
 
 void VideoWidget::initShaders()
@@ -144,6 +154,17 @@ void VideoWidget::resizeGL(int /*w*/, int /*h*/)
     // Ничего — letterbox пересчитывается в paintGL
 }
 
+void VideoWidget::resizeEvent(QResizeEvent* event)
+{
+    QOpenGLWidget::resizeEvent(event);
+
+    // Позиционируем панель управления в нижней части виджета
+    if (m_transport) {
+        int panelH = 60;
+        m_transport->setGeometry(0, height() - panelH, width(), panelH);
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // РЕНДЕР
 // ─────────────────────────────────────────────────────────────────────────────
@@ -187,6 +208,10 @@ void VideoWidget::paintGL()
         painter.setRenderHint(QPainter::TextAntialiasing);
         m_osd.draw(painter, width(), height());
         painter.end();
+
+        // Обновляем панель управления
+        if (m_transport)
+            m_transport->setPosition(m_currentPts, duration(), fps());
     }
 }
 
@@ -199,8 +224,11 @@ void VideoWidget::blitTexToScreen(const NV12Textures& tex, int w, int h)
                             : 16.0f / 9.0f;
     float screenAspect = (h > 0) ? float(w) / float(h) : 1.0f;
 
+    // Обновляем aspect для ZoomPanState (нужно для clampPan)
+    m_zoomPan.setAspects(videoAspect, screenAspect);
+
     // Scale и Offset от ZoomPanState (letterbox + zoom + pan)
-    QPointF scale  = m_zoomPan.calcShaderScale(videoAspect, screenAspect);
+    QPointF scale  = m_zoomPan.calcShaderScale();
     QPointF offset = m_zoomPan.calcShaderOffset();
 
     glActiveTexture(GL_TEXTURE0);
@@ -237,6 +265,9 @@ void VideoWidget::seekTo(double pts)
 
     double fpsVal = m_decoder->fps();
     int64_t targetIdx = static_cast<int64_t>(std::round(pts * fpsVal));
+
+    // Любой seek сбрасывает очередь непрерывного воспроизведения
+    m_continuousPending = 0;
 
     // Определяем направление навигации
     if (m_prevNavIdx >= 0 && targetIdx != m_prevNavIdx) {
@@ -277,14 +308,28 @@ void VideoWidget::seekTo(double pts)
 
 void VideoWidget::setContinuousPlay(bool enabled)
 {
-    if (m_continuousPlay == enabled) return;
+    bool wasEnabled = m_continuousPlay;
     m_continuousPlay = enabled;
     m_continuousPending = 0;
 
-    if (enabled) {
-        qDebug() << "VideoWidget: непрерывное воспроизведение ВКЛ";
-    } else {
-        qDebug() << "VideoWidget: непрерывное воспроизведение ВЫКЛ";
+    if (enabled && !wasEnabled) {
+        // Синхронизируем декодер с текущей позицией (только при переходе в continuous)
+        if (m_decoder && m_fileLoaded) {
+            m_decoder->cancelPrefetch();
+            m_prefetchActive = false;
+            m_decoder->seekAndDecode(m_currentPts);
+        }
+    }
+}
+
+// Принудительная ресинхронизация (для loop)
+void VideoWidget::forceSyncDecoder()
+{
+    m_continuousPending = 0;
+    if (m_decoder && m_fileLoaded && m_continuousPlay) {
+        m_decoder->cancelPrefetch();
+        m_prefetchActive = false;
+        m_decoder->seekAndDecode(m_currentPts);
     }
 }
 
@@ -295,12 +340,12 @@ void VideoWidget::stepFrame(int delta)
     double fpsVal = m_decoder->fps();
     if (fpsVal <= 0.0) return;
 
+    double maxPtsVal = maxPts();  // реальный PTS последнего кадра
+
     // ── Непрерывное воспроизведение: decodeNext без seek ──────────────────────
-    // Ключевое отличие: не вызываем seekTo(), не делаем flush.
-    // Декодер продолжает последовательно читать пакеты из RAM.
     if (m_continuousPlay && delta == 1) {
         // Ограничиваем очередь: максимум 2 pending decodeNext
-        // чтобы не забить декодер при отставании
+        // Конец файла определяется сигналом endOfStream от декодера
         if (m_continuousPending >= 2)
             return;
 
@@ -310,23 +355,25 @@ void VideoWidget::stepFrame(int delta)
     }
 
     // ── Реверс при непрерывном воспроизведении ───────────────────────────────
-    // Реверс не может быть «непрерывным» — HEVC требует декодирования от keyframe.
-    // Используем seekTo (через кэш или decodeGOP).
     if (m_continuousPlay && delta == -1) {
+        // Проверяем начало файла
+        if (m_currentPts <= 0.5 / fpsVal) {
+            emit endOfFileReached();
+            return;
+        }
+
         double newPts = m_currentPts - 1.0 / fpsVal;
-        newPts = std::clamp(newPts, 0.0, m_decoder->duration());
+        newPts = std::clamp(newPts, 0.0, maxPtsVal);
         seekTo(newPts);
         return;
     }
 
     // ── Обычный режим (jog, shuttle, стрелки) ────────────────────────────────
-    // Дроссель: если decode ещё не завершён, накапливаем дрифт
-    // но ограничиваем максимальное забегание вперёд (8 кадров)
     if (m_pendingSeekPts >= 0.0) {
         double nextPts = m_pendingSeekPts + delta / fpsVal;
-        nextPts = std::clamp(nextPts, 0.0, m_decoder->duration());
+        nextPts = std::clamp(nextPts, 0.0, maxPtsVal);
         if (std::abs(nextPts - m_currentPts) > 8.0 / fpsVal)
-            return;  // слишком далеко убежали — пропускаем
+            return;
         m_pendingSeekPts = nextPts;
         m_currentPts = nextPts;
         m_currentIdx = static_cast<int64_t>(std::round(nextPts * fpsVal));
@@ -334,7 +381,7 @@ void VideoWidget::stepFrame(int delta)
     }
 
     double newPts = m_currentPts + delta / fpsVal;
-    newPts = std::clamp(newPts, 0.0, m_decoder->duration());
+    newPts = std::clamp(newPts, 0.0, maxPtsVal);
     seekTo(newPts);
 }
 
@@ -346,6 +393,11 @@ void VideoWidget::shutdown()
     if (m_decoder) {
         m_decoder->stopThread();
         m_decoder.reset();
+    }
+
+    if (m_thumbGen) {
+        m_thumbGen->stopThread();
+        m_thumbGen.reset();
     }
 
     makeCurrent();
@@ -365,6 +417,11 @@ double VideoWidget::duration() const
 double VideoWidget::fps() const
 {
     return m_decoder ? m_decoder->fps() : 0.0;
+}
+
+double VideoWidget::maxPts() const
+{
+    return m_decoder ? m_decoder->lastFramePts() : 0.0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -453,6 +510,21 @@ void VideoWidget::onFileOpened(bool success, const QString& error)
 
     seekTo(0.0);
     emit fileLoaded(true);
+
+    // Передаём данные в панель управления
+    if (m_transport) {
+        // Keyframe карта для snap-to-keyframe
+        std::vector<double> kfPts;
+        for (int i = 0; i < m_decoder->gopCount(); ++i)
+            kfPts.push_back(m_decoder->gop(i).startPts);
+        m_transport->setKeyframePts(kfPts);
+    }
+
+    // Запускаем генерацию превью (фоновый поток)
+    // Путь берём из TransportPanel (он уже установлен через setCurrentFile)
+    if (m_thumbGen && m_transport) {
+        m_thumbGen->openFile(m_transport->currentFilePath());
+    }
 }
 
 void VideoWidget::onSeekComplete(double pts)
@@ -466,9 +538,7 @@ void VideoWidget::onSeekComplete(double pts)
 
 void VideoWidget::onGopDecoded(double startPts, double endPts, int frameCount)
 {
-    qDebug() << "GOP декодирован:" << startPts << "->" << endPts
-             << "кадров:" << frameCount
-             << "в кэше:" << m_ringBuffer->count();
+    Q_UNUSED(startPts) Q_UNUSED(endPts) Q_UNUSED(frameCount)
 
     m_pendingSeekPts = -1.0;
     emit positionChanged(m_currentPts);
@@ -501,6 +571,10 @@ void VideoWidget::schedulePrefetch()
     if (m_prefetchActive) return;
     if (m_decoder->gopCount() < 2) return;
 
+    // Не запускаем prefetch при непрерывном воспроизведении —
+    // он сбивает m_demuxerContinuous и ломает decodeNext
+    if (m_continuousPlay) return;
+
     // Текущий GOP
     int curGopIdx = m_decoder->findGopByPts(m_currentPts);
     if (curGopIdx <= 0) return;  // первый GOP — некуда
@@ -524,6 +598,12 @@ void VideoWidget::onPrefetchGopDecoded(double /*startPts*/, double /*endPts*/,
                                        int /*frameCount*/)
 {
     m_prefetchActive = false;
+}
+
+void VideoWidget::onEndOfStream()
+{
+    m_continuousPending = 0;
+    emit endOfFileReached();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -598,6 +678,10 @@ void VideoWidget::mouseReleaseEvent(QMouseEvent* event)
 
 void VideoWidget::mouseMoveEvent(QMouseEvent* event)
 {
+    // Проверяем видимость панели управления
+    if (m_transport)
+        m_transport->checkCursorVisibility(event->pos(), height());
+
     if (m_inputController)
         m_inputController->handleMouseMove(event->position());
 }
@@ -610,6 +694,10 @@ void VideoWidget::mouseDoubleClickEvent(QMouseEvent* event)
 
 void VideoWidget::wheelEvent(QWheelEvent* event)
 {
+    // Если открыт список файлов — колесо для скролла списка, не для видео
+    if (m_transport && m_transport->isFileListVisible())
+        return;
+
     if (m_inputController)
         m_inputController->handleWheel(event->angleDelta().y(), event->position());
 }

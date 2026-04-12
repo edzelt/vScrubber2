@@ -142,7 +142,6 @@ void FFmpegDecoder::stopThread()
 // ── Главный цикл потока ──────────────────────────────────────────────────────
 void FFmpegDecoder::run()
 {
-    qDebug() << "FFmpegDecoder: поток запущен";
 
     while (m_running) {
         DecodeCmdData cmd;
@@ -183,7 +182,6 @@ void FFmpegDecoder::run()
         }
     }
 
-    qDebug() << "FFmpegDecoder: поток завершён";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -354,9 +352,6 @@ bool FFmpegDecoder::doSeekAndDecode(double pts)
     if (!m_fmtCtx || !m_codecCtx) return false;
 
     int keyPktIdx = m_packetBuffer.findKeyframeBefore(pts);
-    qDebug() << "FFmpegDecoder: seekAndDecode pts=" << QString::number(pts, 'f', 4)
-             << "keyframe pktIdx=" << keyPktIdx
-             << "keyPts=" << QString::number(m_packetBuffer.packetPts(keyPktIdx), 'f', 4);
 
     if (!seekToPacketIdx(keyPktIdx)) return false;
     flushDecoder();
@@ -396,9 +391,6 @@ bool FFmpegDecoder::doDecodeGOP(double targetPts)
     if (!m_fmtCtx || !m_codecCtx) return false;
 
     int keyPktIdx = m_packetBuffer.findKeyframeBefore(targetPts);
-    qDebug() << "FFmpegDecoder: decodeGOP targetPts=" << QString::number(targetPts, 'f', 4)
-             << "keyframe pktIdx=" << keyPktIdx
-             << "keyPts=" << QString::number(m_packetBuffer.packetPts(keyPktIdx), 'f', 4);
 
     if (!seekToPacketIdx(keyPktIdx)) return false;
     flushDecoder();
@@ -528,12 +520,6 @@ bool FFmpegDecoder::doPrefetchGOP(double startPts, double endPts)
         emit prefetchGopDecoded(actualStart, actualEnd, delivered);
     }
 
-    if (delivered > 0 || skipped > 0) {
-        qDebug() << "FFmpegDecoder: prefetch завершён:" << actualStart
-                 << "->" << actualEnd
-                 << "новых:" << delivered << "пропущено:" << skipped;
-    }
-
     return delivered > 0;
 }
 
@@ -546,12 +532,12 @@ bool FFmpegDecoder::doDecodeNext()
 
     // Если demuxer не в непрерывной позиции — нельзя просто читать дальше
     if (!m_demuxerContinuous) {
-        // Fallback: seek на последний известный PTS + 1 кадр
         double targetPts = m_lastDecodedPts + 1.0 / m_fps;
-        qDebug() << "FFmpegDecoder: decodeNext FALLBACK на seekAndDecode!"
-                 << "demuxerContinuous=false, lastPts=" << m_lastDecodedPts
-                 << "targetPts=" << targetPts;
-        return doSeekAndDecode(targetPts);
+        bool ok = doSeekAndDecode(targetPts);
+        if (!ok) {
+            emit endOfStream();
+        }
+        return ok;
     }
 
     AVFrame* frame = av_frame_alloc();
@@ -561,34 +547,16 @@ bool FFmpegDecoder::doDecodeNext()
     if (decodeNextPacket(frame)) {
         double fpts = framePts(frame);
         if (fpts >= 0.0) {
-            // Проверяем разрыв PTS
-            if (m_lastDecodedPts >= 0.0) {
-                double dt = fpts - m_lastDecodedPts;
-                double expectedDt = 1.0 / m_fps;
-                if (dt > expectedDt * 2.5 || dt < -expectedDt * 0.5) {
-                    qWarning() << "FFmpegDecoder: РАЗРЫВ при decodeNext!"
-                               << "предыд. PTS=" << QString::number(m_lastDecodedPts, 'f', 4)
-                               << "текущ. PTS=" << QString::number(fpts, 'f', 4)
-                               << "Δ=" << QString::number(dt * 1000.0, 'f', 1) << "мс"
-                               << "(ожидалось" << QString::number(expectedDt * 1000.0, 'f', 1) << "мс)"
-                               << "readIdx=" << m_readIdx;
-                }
-            }
             m_lastDecodedPts = fpts;
             deliverFrame(frame);
             emit nextDecoded(fpts);
             ok = true;
-        } else {
-            qWarning() << "FFmpegDecoder: decodeNext — кадр без PTS, readIdx=" << m_readIdx;
         }
-    } else {
-        qWarning() << "FFmpegDecoder: decodeNext — decodeNextPacket вернул false,"
-                   << "readIdx=" << m_readIdx
-                   << "из" << m_packetBuffer.packetCount();
     }
 
     if (!ok) {
         m_demuxerContinuous = false;
+        emit endOfStream();
     }
 
     av_frame_free(&frame);

@@ -1,6 +1,9 @@
 #include "inputcontroller.h"
 #include "playbackcontroller.h"
 #include "videowidget.h"
+#include <QMainWindow>
+#include <QMenuBar>
+#include <QApplication>
 #include <QDebug>
 #include <cmath>
 
@@ -8,57 +11,68 @@ InputController::InputController(PlaybackController* playback, QObject* parent)
     : QObject(parent)
     , m_playback(playback)
 {
+    // Таймер для разделения single/double click
+    m_clickTimer.setSingleShot(true);
+    m_clickTimer.setInterval(QApplication::doubleClickInterval());
+    connect(&m_clickTimer, &QTimer::timeout, this, &InputController::onClickTimer);
 }
 
-// ── Обработка нажатий мыши ───────────────────────────────────────────────────
+// ── Нажатие кнопки мыши ──────────────────────────────────────────────────────
 
 void InputController::handleMousePress(Qt::MouseButton button, const QPointF& pos)
 {
     if (button == Qt::LeftButton) {
-        m_leftPressed = true;
-        m_panning = false;
-        m_lastMousePos = pos;
+        m_leftPressed    = true;
+        m_panning        = false;
+        m_leftUsedZoom   = false;
+        m_suppressClick  = false;  // новый press — сбрасываем подавление
+        m_pressPos       = pos;
+        m_lastMousePos   = pos;
     }
     else if (button == Qt::RightButton) {
-        m_rightPressed = true;
-        m_rightUsedWheel = false;  // пока колесо не крутили — меню возможно
+        m_rightPressed   = true;
+        m_rightUsedWheel = false;
     }
     else if (button == Qt::MiddleButton) {
         toggleWheelMode();
     }
 }
 
+// ── Отпускание кнопки мыши ───────────────────────────────────────────────────
+
 void InputController::handleMouseRelease(Qt::MouseButton button, const QPointF& pos)
 {
     Q_UNUSED(pos)
 
     if (button == Qt::LeftButton) {
-        // Если не было pan — это клик → Play/Pause
-        if (!m_panning) {
-            doPlayPause();
+        // Если был pan, zoom или подавлен после doubleClick — не клик
+        if (!m_panning && !m_leftUsedZoom && !m_suppressClick) {
+            m_waitingDoubleClick = true;
+            m_clickTimer.start();
         }
-        m_leftPressed = false;
-        m_panning = false;
+        m_leftPressed  = false;
+        m_panning      = false;
+        m_leftUsedZoom = false;
     }
     else if (button == Qt::RightButton) {
-        // Если ПКМ не использовалась с колесом — показываем контекстное меню
-        if (!m_rightUsedWheel && m_videoWidget) {
-            // Контекстное меню будет обработано стандартным Qt механизмом
-            // (QWidget::customContextMenuRequested или contextMenuEvent)
-        }
-        m_rightPressed = false;
+        // Если ПКМ не использовалась с колесом — контекстное меню (Qt обработает)
+        m_rightPressed   = false;
         m_rightUsedWheel = false;
     }
 }
+
+// ── Движение мыши ────────────────────────────────────────────────────────────
 
 void InputController::handleMouseMove(const QPointF& pos)
 {
     if (m_leftPressed) {
         QPointF delta = pos - m_lastMousePos;
 
-        // Проверяем порог pan — защита от случайного срабатывания при клике
+        // Проверяем порог pan
         if (!m_panning) {
-            double dist = std::sqrt(delta.x() * delta.x() + delta.y() * delta.y());
+            QPointF totalDelta = pos - m_pressPos;
+            double dist = std::sqrt(totalDelta.x() * totalDelta.x() +
+                                    totalDelta.y() * totalDelta.y());
             if (dist >= PAN_THRESHOLD) {
                 m_panning = true;
             }
@@ -72,50 +86,69 @@ void InputController::handleMouseMove(const QPointF& pos)
     }
 }
 
+// ── Двойной клик ─────────────────────────────────────────────────────────────
+
 void InputController::handleMouseDoubleClick(Qt::MouseButton button)
 {
-    if (button == Qt::LeftButton && m_videoWidget) {
-        // Fullscreen toggle
-        QWidget* window = m_videoWidget->window();
-        if (window->isFullScreen()) {
-            window->showNormal();
-        } else {
-            window->showFullScreen();
+    if (button == Qt::LeftButton) {
+        // Отменяем отложенный single click — это double click
+        m_clickTimer.stop();
+        m_waitingDoubleClick = false;
+        m_suppressClick = true;  // подавить play/pause от второго release
+
+        if (m_videoWidget) {
+            QWidget* window = m_videoWidget->window();
+            if (window->isFullScreen()) {
+                window->showNormal();
+                if (auto* mw = qobject_cast<QMainWindow*>(window))
+                    mw->menuBar()->show();
+            } else {
+                if (auto* mw = qobject_cast<QMainWindow*>(window))
+                    mw->menuBar()->hide();
+                window->showFullScreen();
+            }
         }
     }
 }
 
-// ── Обработка колеса мыши ────────────────────────────────────────────────────
-// angleDelta: положительный = вперёд (от себя), отрицательный = назад (к себе)
+// ── Таймер single click (сработал = это был одиночный клик) ──────────────────
+
+void InputController::onClickTimer()
+{
+    if (m_waitingDoubleClick) {
+        m_waitingDoubleClick = false;
+        doPlayPause();
+    }
+}
+
+// ── Колесо мыши ──────────────────────────────────────────────────────────────
 
 void InputController::handleWheel(int angleDelta, const QPointF& pos)
 {
-    // Нормализуем: 1 щелчок = ±120 единиц → ±1 шаг
     int steps = angleDelta / 120;
     if (steps == 0) return;
 
-    // ── ПКМ зажата + колесо: перемотка по ключевым кадрам ────────────────────
+    // ── ПКМ + колесо: перемотка по keyframe ──────────────────────────────────
     if (m_rightPressed) {
         m_rightUsedWheel = true;
 
-        // Сбрасываем shuttle и скорость
         if (m_wheelMode == Shuttle) {
             m_wheelMode = Jog;
             emit wheelModeChanged(m_wheelMode);
         }
         m_playback->pause();
-        m_playback->setSpeed(1.0);  // сбрасываем скорость на 1x
+        m_playback->setSpeed(1.0);
 
-        // Перемотка по keyframe: direction = знак steps
         int direction = (steps > 0) ? 1 : -1;
         emit seekKeyframe(direction);
         return;
     }
 
-    // ── ЛКМ зажата + колесо: zoom ───────────────────────────────────────────
+    // ── ЛКМ + колесо: zoom ──────────────────────────────────────────────────
     if (m_leftPressed) {
+        m_leftUsedZoom = true;
         m_panning = true;  // предотвращаем play/pause при отпускании
-        double zoomDelta = (steps > 0) ? 0.1 : -0.1;
+        double zoomDelta = (steps > 0) ? 1.0 : -1.0;
         emit zoomRequested(zoomDelta, pos);
         return;
     }
@@ -123,27 +156,21 @@ void InputController::handleWheel(int angleDelta, const QPointF& pos)
     // ── Обычное колесо: Jog или Shuttle ──────────────────────────────────────
     switch (m_wheelMode) {
     case Jog:
-        // 1 щелчок = ±1 кадр, пауза воспроизведения
         if (m_playback->isPlaying()) {
             m_playback->pause();
             m_playback->setSpeed(1.0);
         }
-        if (m_videoWidget) {
+        if (m_videoWidget)
             m_videoWidget->stepFrame(steps);
-        }
         break;
 
     case Shuttle:
-        // Колесо меняет скорость на ±0.1x (свободно проходит через 0 в реверс)
-        m_playback->adjustSpeed(steps * 0.1);
+        m_playback->adjustSpeed(steps * 0.2);
 
-        // Автоматический play/pause в зависимости от скорости
         if (std::abs(m_playback->speed()) < 0.05) {
-            // Скорость 0 — пауза
             if (m_playback->isPlaying())
                 m_playback->pause();
         } else {
-            // Скорость ≠ 0 — play
             if (!m_playback->isPlaying())
                 m_playback->play();
         }
@@ -151,7 +178,7 @@ void InputController::handleWheel(int angleDelta, const QPointF& pos)
     }
 }
 
-// ── Обработка клавиатуры ─────────────────────────────────────────────────────
+// ── Клавиатура ───────────────────────────────────────────────────────────────
 
 void InputController::handleKeyPress(int key)
 {
@@ -161,11 +188,12 @@ void InputController::handleKeyPress(int key)
         break;
 
     case Qt::Key_Escape:
-        // Выход из fullscreen
         if (m_videoWidget) {
             QWidget* window = m_videoWidget->window();
             if (window->isFullScreen()) {
                 window->showNormal();
+                if (auto* mw = qobject_cast<QMainWindow*>(window))
+                    mw->menuBar()->show();
             }
         }
         break;
@@ -176,40 +204,49 @@ void InputController::handleKeyPress(int key)
 }
 
 // ── Play/Pause с полным сбросом shuttle ──────────────────────────────────────
-// Любая команда Play (ЛКМ / Space) сбрасывает Jog/Shuttle
-// и возвращает нормальную скорость 1x.
+
 void InputController::doPlayPause()
 {
     if (m_playback->isPlaying()) {
         m_playback->pause();
     } else {
-        // Сброс shuttle → jog
         if (m_wheelMode == Shuttle) {
             m_wheelMode = Jog;
             emit wheelModeChanged(m_wheelMode);
         }
-        // Сброс скорости на 1x
         m_playback->setSpeed(1.0);
         m_playback->play();
     }
 }
 
+// ── Сброс ────────────────────────────────────────────────────────────────────
+
+void InputController::reset()
+{
+    m_wheelMode = Jog;
+    m_leftPressed = false;
+    m_rightPressed = false;
+    m_rightUsedWheel = false;
+    m_panning = false;
+    m_leftUsedZoom = false;
+    m_clickTimer.stop();
+    m_waitingDoubleClick = false;
+    m_suppressClick = false;
+    emit wheelModeChanged(m_wheelMode);
+}
+
 // ── Переключение режима колеса ───────────────────────────────────────────────
+
 void InputController::toggleWheelMode()
 {
     if (m_wheelMode == Jog) {
         m_wheelMode = Shuttle;
-        // При входе в shuttle — пауза, скорость 0
-        // Пользователь колесом будет задавать скорость и направление
         m_playback->pause();
         m_playback->setSpeed(0.0);
-        qDebug() << "InputController: режим Shuttle";
     } else {
         m_wheelMode = Jog;
-        // При выходе из shuttle — пауза, сброс скорости
         m_playback->pause();
         m_playback->setSpeed(1.0);
-        qDebug() << "InputController: режим Jog";
     }
     emit wheelModeChanged(m_wheelMode);
 }

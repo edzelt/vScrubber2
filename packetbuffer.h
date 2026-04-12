@@ -93,6 +93,9 @@ public:
     double maxGopDuration() const { return m_maxGopDuration; }
     int    maxGopFrames()   const { return m_maxGopFrames; }
 
+    // Максимальный PTS среди всех пакетов (реальный конец видео)
+    double lastFramePts() const { return m_lastFramePts; }
+
     // ── Диагностика ──────────────────────────────────────────────────────────
     void validatePackets() const;
 
@@ -109,5 +112,6 @@ private:
     size_t m_totalBytes      = 0;
     double m_maxGopDuration  = 0.0;
     int    m_maxGopFrames    = 0;
+    double m_lastFramePts    = 0.0;
     bool   m_loaded          = false;
 };

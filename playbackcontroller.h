@@ -77,7 +77,7 @@ private:
     double         m_frameDebt = 0.0;  // накопленные «недопоказанные» кадры
 
     // ── Ограничения ──────────────────────────────────────────────────────────
-    static constexpr double MIN_SPEED =  0.1;
+    static constexpr double MIN_SPEED =  0.2;
     static constexpr double MAX_SPEED =  3.0;
     static constexpr int    TICK_INTERVAL_MS = 2;  // интервал тика
 };

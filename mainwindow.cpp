@@ -2,12 +2,12 @@
 #include "videowidget.h"
 #include "playbackcontroller.h"
 #include "inputcontroller.h"
+#include "transportpanel.h"
 #include <QMenuBar>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QKeyEvent>
 #include <QApplication>
-#include <QDebug>
-#include <cmath>
 
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
@@ -37,6 +37,8 @@ MainWindow::MainWindow(QWidget* parent)
             this, &MainWindow::onFileLoaded);
     connect(m_videoWidget, &VideoWidget::positionChanged,
             this, &MainWindow::onPositionChanged);
+    connect(m_videoWidget, &VideoWidget::endOfFileReached,
+            this, &MainWindow::onEndOfFile);
 
     // ── Связи: PlaybackController → VideoWidget ──────────────────────────────
     // Шаг кадров: контроллер говорит сколько кадров показать
@@ -74,6 +76,24 @@ MainWindow::MainWindow(QWidget* parent)
             this, [this](InputController::WheelMode mode) {
                 m_videoWidget->setOsdWheelMode(static_cast<int>(mode));
             });
+
+    // ── Связи: TransportPanel → MainWindow ───────────────────────────────────
+    auto* tp = m_videoWidget->transportPanel();
+    if (tp) {
+        connect(tp, &TransportPanel::seekRequested,
+                this, [this](double pts) {
+                    bool wasPlaying = m_playback->isPlaying();
+                    // Обновляем позицию
+                    m_videoWidget->seekTo(pts);
+                    // Ресинхронизируем декодер если играет
+                    if (wasPlaying)
+                        m_videoWidget->forceSyncDecoder();
+                });
+        connect(tp, &TransportPanel::fileSelected,
+                this, [this](const QString& path) {
+                    openFileKeepState(path);
+                });
+    }
 }
 
 MainWindow::~MainWindow() = default;
@@ -112,11 +132,39 @@ void MainWindow::onOpenFile()
 
 void MainWindow::openFile(const QString& path)
 {
-    // Останавливаем воспроизведение
+    // Полный сброс при ручном открытии
     m_playback->stop();
+    m_playback->setSpeed(1.0);
+    m_input->reset();
+    m_videoWidget->resetZoom();
+    m_videoWidget->setOsdSpeed(1.0);
+    m_videoWidget->setOsdWheelMode(0);
+
+    openFileKeepState(path);
+}
+
+void MainWindow::openFileKeepState(const QString& path)
+{
+    // Открытие файла с сохранением текущего режима воспроизведения
+    double savedSpeed = m_playback->speed();
+    bool wasPlaying = m_playback->isPlaying();
+
+    // Останавливаем воспроизведение на время загрузки
+    if (wasPlaying)
+        m_playback->pause();
+    m_videoWidget->setContinuousPlay(false);
+
+    if (m_videoWidget->transportPanel())
+        m_videoWidget->transportPanel()->setCurrentFile(path);
 
     m_videoWidget->openFile(path);
-    setWindowTitle(QString("vScrubber2 — %1").arg(path));
+
+    // Сохраняем скорость и состояние — восстановим в onFileLoaded
+    m_pendingSpeed = savedSpeed;
+    m_pendingPlay  = wasPlaying;
+
+    QFileInfo fi(path);
+    setWindowTitle(QString("vScrubber2 — %1").arg(fi.fileName()));
 }
 
 // ── Клавиатура ───────────────────────────────────────────────────────────────
@@ -136,34 +184,26 @@ void MainWindow::onFileLoaded(bool success)
 {
     if (!success) {
         setWindowTitle("vScrubber2 — ошибка открытия файла");
+        m_pendingPlay = false;
         return;
     }
 
-    // Передаём FPS в контроллер воспроизведения
     m_playback->setFps(m_videoWidget->fps());
     updateTitle();
+
+    // Восстанавливаем режим воспроизведения (при переходе между файлами)
+    if (m_pendingPlay) {
+        m_playback->setSpeed(m_pendingSpeed);
+        m_videoWidget->setOsdSpeed(m_pendingSpeed);
+        m_playback->play();
+        m_pendingPlay = false;
+    }
 }
 
 void MainWindow::onPositionChanged(double pts)
 {
     Q_UNUSED(pts)
     updateTitle();
-
-    // Проверяем конец файла
-    if (m_playback->isPlaying()) {
-        double dur = m_videoWidget->duration();
-        double cur = m_videoWidget->currentPts();
-        double spd = m_playback->speed();
-
-        // Конец файла при движении вперёд
-        if (spd > 0.0 && cur >= dur - 0.01) {
-            m_playback->notifyEndOfFile();
-        }
-        // Начало файла при реверсе
-        if (spd < 0.0 && cur <= 0.01) {
-            m_playback->notifyEndOfFile();
-        }
-    }
 }
 
 void MainWindow::onSpeedChanged(double speed)
@@ -184,7 +224,6 @@ void MainWindow::onSeekKeyframe(int direction)
     if (!m_videoWidget->isFileLoaded()) return;
 
     double currentPts = m_videoWidget->currentPts();
-    double fps = m_videoWidget->fps();
 
     // Находим текущий GOP
     int curGop = m_videoWidget->findGopByPts(currentPts);
@@ -206,35 +245,49 @@ void MainWindow::updateTitle()
 {
     if (!m_videoWidget->isFileLoaded()) return;
 
-    QString state;
-    switch (m_playback->state()) {
-    case PlaybackController::Playing: state = "▶"; break;
-    case PlaybackController::Paused:  state = "⏸"; break;
-    case PlaybackController::Stopped: state = "⏹"; break;
+    QString fileName;
+    auto* tp = m_videoWidget->transportPanel();
+    if (tp) {
+        QFileInfo fi(tp->currentFilePath());
+        fileName = fi.fileName();
     }
 
-    double pts = m_videoWidget->currentPts();
-    double dur = m_videoWidget->duration();
-    double speed = m_playback->speed();
+    setWindowTitle(QString("vScrubber2 — %1").arg(fileName));
+}
 
-    int curMin   = static_cast<int>(pts) / 60;
-    int curSec   = static_cast<int>(pts) % 60;
-    int curFrame = static_cast<int>(m_videoWidget->currentIdx() %
-                                    static_cast<int64_t>(m_videoWidget->fps()));
-    int durMin   = static_cast<int>(dur) / 60;
-    int durSec   = static_cast<int>(dur) % 60;
+// ── Обработка конца/начала файла при воспроизведении ──────────────────────────
+void MainWindow::onEndOfFile()
+{
+    auto* tp = m_videoWidget->transportPanel();
+    double spd = m_playback->speed();
+    bool loopFile = tp && tp->isLoopFile();
+    bool loopDir  = tp && tp->isLoopDir();
 
-    QString speedStr;
-    if (std::abs(speed - 1.0) > 0.05) {
-        speedStr = QString(" [%1x]").arg(speed, 0, 'f', 1);
+    if (loopFile && !loopDir) {
+        // Только Loop: зацикливаем текущий файл
+        double targetPts = (spd > 0.0) ? 0.0 : m_videoWidget->maxPts();
+        m_videoWidget->seekTo(targetPts);
+        m_videoWidget->forceSyncDecoder();
+    } else if (loopDir || loopFile) {
+        // Dir (без Loop): проиграть до конца каталога, остановиться
+        // Dir + Loop: зациклить весь каталог
+        bool hasNext = true;
+        if (spd > 0.0) {
+            hasNext = tp->tryNextFile();
+        } else {
+            hasNext = tp->tryPrevFile();
+        }
+        // Если файлов больше нет и Loop+Dir — зацикливаем каталог
+        if (!hasNext && loopFile && loopDir) {
+            if (spd > 0.0)
+                tp->goToFirstFile();
+            else
+                tp->goToLastFile();
+        } else if (!hasNext) {
+            m_playback->notifyEndOfFile();
+        }
+    } else {
+        // Ничего не нажато — стоп
+        m_playback->notifyEndOfFile();
     }
-
-    setWindowTitle(QString("vScrubber2 %1 %2:%3.%4 / %5:%6%7")
-                       .arg(state)
-                       .arg(curMin, 2, 10, QChar('0'))
-                       .arg(curSec, 2, 10, QChar('0'))
-                       .arg(curFrame, 2, 10, QChar('0'))
-                       .arg(durMin, 2, 10, QChar('0'))
-                       .arg(durSec, 2, 10, QChar('0'))
-                       .arg(speedStr));
 }

@@ -10,8 +10,10 @@
 #include "frameringbuffer.h"
 #include "zoompanstate.h"
 #include "osd.h"
+#include "thumbnailgenerator.h"
 
 class InputController;
+class TransportPanel;
 
 // ── Видео-виджет: decode pipeline + OpenGL рендер ────────────────────────────
 //
@@ -54,6 +56,7 @@ public:
     // При pause/jog — обычный путь через seekTo().
     void setContinuousPlay(bool enabled);
     bool isContinuousPlay() const { return m_continuousPlay; }
+    void forceSyncDecoder();   // принудительная ресинхронизация (для loop)
 
     // ── GOP навигация (для перемотки по keyframe) ────────────────────────────
     int    gopCount()       const;
@@ -65,6 +68,7 @@ public:
     int64_t currentIdx() const { return m_currentIdx; }
     double  duration()   const;
     double  fps()        const;
+    double  maxPts()     const;   // реальный PTS последнего кадра
     bool    isFileLoaded() const { return m_fileLoaded; }
 
     // ── Zoom/Pan ─────────────────────────────────────────────────────────────
@@ -77,9 +81,13 @@ public:
     void setOsdSpeed(double speed);
     void setOsdWheelMode(int mode);
 
+    // ── Панель управления ────────────────────────────────────────────────────
+    TransportPanel* transportPanel() const { return m_transport; }
+
 signals:
     void fileLoaded(bool success);
     void positionChanged(double pts);
+    void endOfFileReached();           // конец или начало файла при воспроизведении
 
 protected:
     void initializeGL() override;
@@ -91,6 +99,7 @@ protected:
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseDoubleClickEvent(QMouseEvent* event) override;
     void wheelEvent(QWheelEvent* event) override;
+    void resizeEvent(QResizeEvent* event) override;
 
 private slots:
     void onFileOpened(bool success, const QString& error);
@@ -98,6 +107,7 @@ private slots:
     void onGopDecoded(double startPts, double endPts, int frameCount);
     void onNextDecoded(double pts);
     void onPrefetchGopDecoded(double startPts, double endPts, int frameCount);
+    void onEndOfStream();
 
 private:
     void initShaders();
@@ -143,6 +153,12 @@ private:
 
     // ── OSD ──────────────────────────────────────────────────────────────────
     OSD m_osd;
+
+    // ── Панель управления ────────────────────────────────────────────────────
+    TransportPanel* m_transport = nullptr;
+
+    // ── Генератор превью ─────────────────────────────────────────────────────
+    std::unique_ptr<ThumbnailGenerator> m_thumbGen;
 
     // ── Пул буферов для копирования NV12 данных из decode потока ─────────────
     // Избегаем аллокации на каждый кадр — переиспользуем буферы.

@@ -2,8 +2,15 @@
 #include <QSurfaceFormat>
 #include "mainwindow.h"
 
+extern "C" {
+#include <libavutil/log.h>
+}
+
 int main(int argc, char* argv[])
 {
+    // Подавляем предупреждения FFmpeg (Late SEI и т.п.)
+    av_log_set_level(AV_LOG_ERROR);
+
     // ── OpenGL 4.5 Core ──────────────────────────────────────────────────────
     QSurfaceFormat fmt;
     fmt.setVersion(4, 5);

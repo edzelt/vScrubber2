@@ -109,6 +109,7 @@ public:
     // ── Свойства файла (валидны после сигнала fileOpened) ─────────────────────
     double duration()  const { return m_duration; }
     double fps()       const { return m_fps; }
+    double lastFramePts() const { return m_packetBuffer.lastFramePts(); }
     int    videoWidth()  const { return m_width; }
     int    videoHeight() const { return m_height; }
     bool   isHWAccel() const { return m_hwAccel; }
@@ -127,6 +128,7 @@ signals:
     void gopDecoded(double startPts, double endPts, int frameCount);
     void prefetchGopDecoded(double startPts, double endPts, int frameCount);
     void nextDecoded(double pts);         // один кадр декодирован (decodeNext)
+    void endOfStream();                   // конец потока — больше нет кадров
     void decoderError(const QString& msg);
 
 protected:
