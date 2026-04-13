@@ -7,7 +7,7 @@
 #include <atomic>
 
 #include "ffmpegdecoder.h"
-#include "frameringbuffer.h"
+#include "gopcache.h"
 #include "zoompanstate.h"
 #include "osd.h"
 #include "thumbnailgenerator.h"
@@ -19,9 +19,9 @@ class TransportPanel;
 //
 // Движок vScrubber2:
 //   - Декодирование: FFmpeg + NVDEC, пакеты в RAM (PacketBuffer)
-//   - Кэш кадров:   NV12 текстуры на GPU (FrameRingBuffer, 2 GOP)
-//   - Рендер:        OpenGL 4.5, YUV→RGB конвертация в шейдере (BT.709)
-//   - Prefetch:      автоматическая подгрузка предыдущего GOP для реверса
+//   - Кэш кадров:   NV12 в RAM (GopCache), кольцевой буфер GOP-слотов
+//   - Рендер:        OpenGL 4.5, YUV→RGB в шейдере (BT.709)
+//   - Буфер:         хвост распакованных GOP для мгновенного реверса
 //
 // Готовые точки интеграции для UI:
 //   - seekTo(pts)     — перемотка на произвольную позицию (для ползунка)
@@ -49,14 +49,7 @@ public:
 
     // ── Навигация ────────────────────────────────────────────────────────────
     void seekTo(double pts);          // перемотка на PTS (секунды)
-    void stepFrame(int delta);        // +1 вперёд, -1 назад
-
-    // ── Режим непрерывного воспроизведения ───────────────────────────────────
-    // При play() — кадры декодируются последовательно без seek+flush.
-    // При pause/jog — обычный путь через seekTo().
-    void setContinuousPlay(bool enabled);
-    bool isContinuousPlay() const { return m_continuousPlay; }
-    void forceSyncDecoder(double pts);   // принудительная ресинхронизация (для loop)
+    void stepFrame(int delta);        // +N вперёд, -N назад
 
     // ── GOP навигация (для перемотки по keyframe) ────────────────────────────
     int    gopCount()       const;
@@ -104,22 +97,24 @@ protected:
 
 private slots:
     void onFileOpened(bool success, const QString& error);
-    void onSeekComplete(double pts);
     void onGopDecoded(double startPts, double endPts, int frameCount);
     void onNextDecoded(double pts);
-    void onPrefetchGopDecoded(double startPts, double endPts, int frameCount);
     void onEndOfStream();
 
 private:
     void initShaders();
     void blitTexToScreen(const NV12Textures& tex, int w, int h);
     void onFrameDecoded(const DecodedFrame& frame);
-    void schedulePrefetch();
+
+    // ── Управление GOP-кэшем ─────────────────────────────────────────────────
+    void ensureGopLoaded(int gopIdx);      // текущий GOP загружен или загружается?
+    void fillTailBackground();             // фоновое наращивание хвоста назад
+    int  gopIdxForFrame(int64_t frameIdx) const;
 
     // ── Подсистемы ───────────────────────────────────────────────────────────
     std::unique_ptr<FFmpegDecoder>   m_decoder;
-    std::unique_ptr<FrameRingBuffer> m_ringBuffer;
-    InputController* m_inputController = nullptr;  // не владеет
+    std::unique_ptr<GopCache>        m_gopCache;
+    InputController* m_inputController = nullptr;
 
     // ── OpenGL ───────────────────────────────────────────────────────────────
     std::unique_ptr<QOpenGLShaderProgram> m_shader;
@@ -131,22 +126,18 @@ private:
     double   m_pendingSeekPts  = -1.0;
     std::atomic<int64_t> m_lastDecodedIdx{-1};
 
-    // ── Непрерывное воспроизведение ──────────────────────────────────────────
-    bool     m_continuousPlay  = false;
-    int      m_continuousPending = 0;
-    bool     m_syncOnly        = false;  // seekAndDecode только для позиционирования
+    // ── GOP-управление ───────────────────────────────────────────────────────
+    int      m_currentGopIdx   = -1;    // индекс текущего GOP
+    int      m_fillingGopIdx   = -1;    // GOP который сейчас заполняет декодер
+    bool     m_fillInProgress  = false; // декодер занят заполнением
 
-    // ── Fallback-текстура (показывается пока decode не завершён) ──────────────
-    NV12Textures m_lastDisplayedTex;
-    int64_t      m_lastDisplayedIdx = -1;
-
-    // ── Prefetch ─────────────────────────────────────────────────────────────
-    bool     m_prefetchActive  = false;
+    // ── Fallback — последний показанный кадр ────────────────────────────────
+    int64_t  m_lastDisplayedIdx = -1;
 
     // ── Флаги ────────────────────────────────────────────────────────────────
     bool     m_initialized     = false;
     bool     m_fileLoaded      = false;
-    bool     m_isFullRange     = false;   // color range видео
+    bool     m_isFullRange     = false;
 
     // ── Zoom/Pan ─────────────────────────────────────────────────────────────
     ZoomPanState m_zoomPan;
@@ -160,8 +151,7 @@ private:
     // ── Генератор превью ─────────────────────────────────────────────────────
     std::unique_ptr<ThumbnailGenerator> m_thumbGen;
 
-    // ── Пул буферов для копирования NV12 данных из decode потока ─────────────
-    // Избегаем аллокации на каждый кадр — переиспользуем буферы.
+    // ── Пул буферов для копирования NV12 из decode потока ─────────────────────
     static constexpr int BUFFER_POOL_SIZE = 4;
     struct FrameBuffer {
         std::shared_ptr<std::vector<uint8_t>> data;

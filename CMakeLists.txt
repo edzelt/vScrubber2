@@ -75,7 +75,7 @@ set(SOURCES
     mainwindow.cpp
     videowidget.cpp
     ffmpegdecoder.cpp
-    frameringbuffer.cpp
+    gopcache.cpp
     packetbuffer.cpp
     playbackcontroller.cpp
     inputcontroller.cpp
@@ -89,7 +89,7 @@ set(HEADERS
     mainwindow.h
     videowidget.h
     ffmpegdecoder.h
-    frameringbuffer.h
+    gopcache.h
     packetbuffer.h
     playbackcontroller.h
     inputcontroller.h

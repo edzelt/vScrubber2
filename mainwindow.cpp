@@ -47,9 +47,7 @@ MainWindow::MainWindow(QWidget* parent)
     connect(m_playback, &PlaybackController::stepRequested,
             m_videoWidget, &VideoWidget::stepFrame);
 
-    // Непрерывное воспроизведение: decodeNext без seek+flush
-    connect(m_playback, &PlaybackController::continuousPlayChanged,
-            m_videoWidget, &VideoWidget::setContinuousPlay);
+    // continuousPlay больше не нужен — буфер обеспечивает мгновенность
 
     // ── Связи: PlaybackController → MainWindow (обновление UI) ───────────────
     connect(m_playback, &PlaybackController::speedChanged,
@@ -149,7 +147,6 @@ void MainWindow::openFileKeepState(const QString& path)
     // Останавливаем воспроизведение на время загрузки
     if (wasPlaying)
         m_playback->pause();
-    m_videoWidget->setContinuousPlay(false);
 
     if (m_videoWidget->transportPanel())
         m_videoWidget->transportPanel()->setCurrentFile(path);
@@ -264,7 +261,6 @@ void MainWindow::onEndOfFile()
         // Только Loop: зацикливаем текущий файл
         double targetPts = (spd > 0.0) ? 0.0 : m_videoWidget->maxPts();
         m_videoWidget->seekTo(targetPts);
-        m_videoWidget->forceSyncDecoder(targetPts);
     } else if (loopDir || loopFile) {
         // Dir (без Loop): проиграть до конца каталога, остановиться
         // Dir + Loop: зациклить весь каталог

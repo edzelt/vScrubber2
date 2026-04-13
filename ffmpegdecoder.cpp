@@ -44,8 +44,9 @@ static void enqueueCmd(QList<DecodeCmdData>& queue, DecodeCmdData cmd,
         prefetchInterrupt.store(true, std::memory_order_release);
     }
 
-    // Для seek/GOP — заменяем предыдущую однотипную команду (дедупликация)
-    if (cmd.cmd == DecodeCmd::SeekAndDecode || cmd.cmd == DecodeCmd::DecodeGOP) {
+    // Для seek/GOP/sync — заменяем предыдущую однотипную команду (дедупликация)
+    if (cmd.cmd == DecodeCmd::SeekAndDecode || cmd.cmd == DecodeCmd::DecodeGOP
+        || cmd.cmd == DecodeCmd::SyncPosition) {
         for (int i = 0; i < queue.size(); ++i) {
             if (queue[i].cmd == cmd.cmd) {
                 queue[i] = cmd;
@@ -101,6 +102,14 @@ void FFmpegDecoder::decodeNext()
 {
     QMutexLocker lk(&m_cmdMutex);
     DecodeCmdData cmd{ DecodeCmd::DecodeNext, {}, 0.0 };
+    enqueueCmd(m_cmdQueue, cmd, m_prefetchInterrupt);
+    m_cmdCond.wakeOne();
+}
+
+void FFmpegDecoder::syncPosition(double pts)
+{
+    QMutexLocker lk(&m_cmdMutex);
+    DecodeCmdData cmd{ DecodeCmd::SyncPosition, {}, pts };
     enqueueCmd(m_cmdQueue, cmd, m_prefetchInterrupt);
     m_cmdCond.wakeOne();
 }
@@ -171,6 +180,9 @@ void FFmpegDecoder::run()
             break;
         case DecodeCmd::DecodeNext:
             doDecodeNext();
+            break;
+        case DecodeCmd::SyncPosition:
+            doSyncPosition(cmd.targetPts);
             break;
         case DecodeCmd::PrefetchGOP:
             // Сбрасываем флаг прерывания перед началом
@@ -347,12 +359,12 @@ void FFmpegDecoder::doClose()
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── Seek + декодировать один кадр (для jog/покадровой навигации) ──────────────
+// Ищет кадр с PTS ближайшим к target. Доставляет только его.
 bool FFmpegDecoder::doSeekAndDecode(double pts)
 {
     if (!m_fmtCtx || !m_codecCtx) return false;
 
     int keyPktIdx = m_packetBuffer.findKeyframeBefore(pts);
-
     if (!seekToPacketIdx(keyPktIdx)) return false;
     flushDecoder();
 
@@ -364,10 +376,6 @@ bool FFmpegDecoder::doSeekAndDecode(double pts)
         return false;
     }
 
-    // Декодируем от keyframe, ищем кадр с PTS ближайшим к target.
-    // B-frames: декодер выдаёт кадры в display order, но после flush
-    // первые кадры могут прыгать. Декодируем до target + 3 кадра запаса.
-    double targetPts = pts;
     double bestPts = -1.0;
     double bestDiff = 1e9;
     int framesAfterTarget = 0;
@@ -376,7 +384,7 @@ bool FFmpegDecoder::doSeekAndDecode(double pts)
         double fpts = framePts(frame);
 
         if (fpts >= 0.0) {
-            double diff = std::abs(fpts - targetPts);
+            double diff = std::abs(fpts - pts);
             if (diff < bestDiff) {
                 bestDiff = diff;
                 bestPts = fpts;
@@ -386,12 +394,10 @@ bool FFmpegDecoder::doSeekAndDecode(double pts)
                 av_frame_unref(frame);
             }
 
-            if (fpts >= targetPts)
+            if (fpts >= pts)
                 framesAfterTarget++;
 
-            // 3 кадра после target — reorder buffer исчерпан
             if (framesAfterTarget >= 3) break;
-            // Точное попадание
             if (bestDiff < 0.001) break;
         } else {
             av_frame_unref(frame);
@@ -412,16 +418,14 @@ bool FFmpegDecoder::doSeekAndDecode(double pts)
     return found;
 }
 
-// ── Декодировать весь GOP: от keyframe до targetPts ──────────────────────────
-// Вызывает callback для КАЖДОГО декодированного кадра — для заполнения кэша.
-// Это ключевая операция для быстрого реверса: один seek декодирует ~30-90
-// кадров, и все они попадают в GPU-кэш.
+// ── Декодировать GOP: от keyframe до targetPts, доставляя ВСЕ кадры ─────────
+// Ключевая операция для быстрого реверса: один seek декодирует ~30-90
+// кадров, и все попадают в GPU-кэш.
 bool FFmpegDecoder::doDecodeGOP(double targetPts)
 {
     if (!m_fmtCtx || !m_codecCtx) return false;
 
     int keyPktIdx = m_packetBuffer.findKeyframeBefore(targetPts);
-
     if (!seekToPacketIdx(keyPktIdx)) return false;
     flushDecoder();
 
@@ -438,22 +442,19 @@ bool FFmpegDecoder::doDecodeGOP(double targetPts)
         if (startPts < 0.0) startPts = fpts;
         endPts = fpts;
 
-        // Отправляем каждый кадр в callback — все идут в кэш
         m_lastDecodedPts = fpts;
         deliverFrame(frame);
         count++;
         av_frame_unref(frame);
 
-        // Дошли до целевого PTS — дальше не нужно
         if (fpts >= targetPts - 0.5 / m_fps)
             break;
 
-        // Защита от бесконечного цикла (макс. 300 кадров = ~10 сек)
         if (count > 300) break;
     }
 
     av_frame_free(&frame);
-    m_demuxerContinuous = (count > 0);  // demuxer на позиции после последнего кадра
+    m_demuxerContinuous = (count > 0);
     emit gopDecoded(startPts, endPts, count);
     return count > 0;
 }
@@ -551,6 +552,54 @@ bool FFmpegDecoder::doPrefetchGOP(double startPts, double endPts)
     }
 
     return delivered > 0;
+}
+
+// ── Ресинхрон декодера на PTS без доставки кадров ─────────────────────────────
+// Seek на keyframe, decode до target — но НЕ вызывает deliverFrame.
+// Только ставит m_readIdx и m_demuxerContinuous = true.
+// Используется для старта continuous play с произвольной позиции.
+// Значительно быстрее seekAndDecode — не тратит время на HW transfer и копирование.
+bool FFmpegDecoder::doSyncPosition(double targetPts)
+{
+    if (!m_fmtCtx || !m_codecCtx) return false;
+
+    int keyPktIdx = m_packetBuffer.findKeyframeBefore(targetPts);
+    if (!seekToPacketIdx(keyPktIdx)) return false;
+    flushDecoder();
+
+    AVFrame* frame = av_frame_alloc();
+    if (!frame) return false;
+
+    double bestPts = -1.0;
+    int framesAfterTarget = 0;
+
+    while (decodeNextPacket(frame)) {
+        double fpts = framePts(frame);
+        av_frame_unref(frame);
+
+        if (fpts >= 0.0) {
+            bestPts = fpts;
+
+            if (fpts >= targetPts)
+                framesAfterTarget++;
+
+            // Точное попадание или 3 кадра после target — reorder buffer исчерпан
+            if (std::abs(fpts - targetPts) < 0.001 || framesAfterTarget >= 3)
+                break;
+        }
+    }
+
+    av_frame_free(&frame);
+
+    if (bestPts >= 0.0) {
+        m_lastDecodedPts = bestPts;
+        m_demuxerContinuous = true;
+        emit syncReady(bestPts);
+        return true;
+    }
+
+    m_demuxerContinuous = false;
+    return false;
 }
 
 // ── Декодировать один следующий кадр без seek (быстро!) ───────────────────────

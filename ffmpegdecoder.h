@@ -39,6 +39,7 @@ enum class DecodeCmd {
     SeekAndDecode, // seek на PTS + декодировать кадр
     DecodeGOP,     // декодировать весь GOP от keyframe до targetPts
     DecodeNext,    // декодировать следующий кадр без seek (быстро)
+    SyncPosition,  // seek + decode до target БЕЗ deliverFrame (быстрый ресинхрон)
     PrefetchGOP,   // фоновое упреждающее декодирование GOP (низкий приоритет)
     Stop
 };
@@ -48,6 +49,7 @@ inline int decodeCmdPriority(DecodeCmd cmd) {
     switch (cmd) {
     case DecodeCmd::Stop:          return 100;
     case DecodeCmd::Open:          return 90;
+    case DecodeCmd::SyncPosition:  return 85;  // выше DecodeNext — sync должен завершиться первым
     case DecodeCmd::DecodeNext:    return 80;
     case DecodeCmd::SeekAndDecode: return 70;
     case DecodeCmd::DecodeGOP:     return 60;
@@ -93,6 +95,7 @@ public:
     void seekAndDecode(double pts);
     void decodeGOP(double pts);
     void decodeNext();             // следующий кадр без seek
+    void syncPosition(double pts);  // ресинхрон декодера на PTS без доставки кадров
     void prefetchGOP(double startPts, double endPts); // фоновый prefetch диапазона
     void cancelPrefetch();         // отменить все ожидающие prefetch-команды
     void stopThread();
@@ -125,6 +128,7 @@ public:
 signals:
     void fileOpened(bool success, const QString& error);
     void seekComplete(double pts);        // кадр декодирован и отправлен в callback
+    void syncReady(double pts);           // ресинхрон завершён, декодер готов к decodeNext
     void gopDecoded(double startPts, double endPts, int frameCount);
     void prefetchGopDecoded(double startPts, double endPts, int frameCount);
     void nextDecoded(double pts);         // один кадр декодирован (decodeNext)
@@ -144,6 +148,7 @@ private:
     // ── Декодирование ────────────────────────────────────────────────────────
     bool doSeekAndDecode(double pts);
     bool doDecodeGOP(double targetPts);
+    bool doSyncPosition(double targetPts);     // seek + decode до target без deliverFrame
     bool doPrefetchGOP(double startPts, double endPts); // прерываемый prefetch диапазона
     bool doDecodeNext();               // следующий кадр без seek
 

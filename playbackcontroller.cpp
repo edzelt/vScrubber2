@@ -105,9 +105,8 @@ void PlaybackController::onTick()
     if (framesToStep > 0) {
         m_frameDebt -= framesToStep;
         int direction = (m_speed < 0.0) ? -1 : 1;
-
-        for (int i = 0; i < framesToStep; ++i)
-            emit stepRequested(direction);
+        // Один вызов с суммарным delta — VideoWidget обработает |delta| > 1
+        emit stepRequested(framesToStep * direction);
     }
 }
 
