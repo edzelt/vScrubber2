@@ -87,7 +87,8 @@ public:
 signals:
     void fileLoaded(bool success);
     void positionChanged(double pts);
-    void endOfFileReached();           // конец или начало файла при воспроизведении
+    void endOfFileReached();
+    void seekCompleted();              // seek/gopDecode завершён — для resetClock
 
 protected:
     void initializeGL() override;
@@ -131,8 +132,9 @@ private:
     std::atomic<int64_t> m_lastDecodedIdx{-1};
 
     // ── Непрерывное воспроизведение ──────────────────────────────────────────
-    bool     m_continuousPlay  = false;  // режим непрерывного декодирования
-    int      m_continuousPending = 0;    // сколько decodeNext в очереди
+    bool     m_continuousPlay  = false;
+    int      m_continuousPending = 0;
+    bool     m_syncOnly        = false;  // seekAndDecode только для позиционирования
 
     // ── Fallback-текстура (показывается пока decode не завершён) ──────────────
     NV12Textures m_lastDisplayedTex;

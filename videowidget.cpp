@@ -268,31 +268,24 @@ void VideoWidget::seekTo(double pts)
 
     m_continuousPending = 0;
 
-    // Cache hit — показываем мгновенно, обновляем позицию
+    // Cache hit — показываем мгновенно
     if (m_ringBuffer && m_ringBuffer->lookup(targetIdx)) {
         m_currentPts = pts;
         m_currentIdx = targetIdx;
         m_pendingSeekPts = -1.0;
+        m_lastDecodedIdx.store(targetIdx, std::memory_order_release);
         emit positionChanged(pts);
+        emit seekCompleted();
         update();
         schedulePrefetch();
         return;
     }
 
-    // Cache miss — запоминаем цель, но НЕ обновляем m_currentPts/m_currentIdx
-    // до прихода реально декодированного кадра (onSeekComplete).
-    // Это предотвращает дёрганье: paintGL продолжает показывать предыдущий кадр.
+    // Cache miss — декодируем весь GOP (заполняет кэш для быстрого реверса)
     m_pendingSeekPts = pts;
     m_decoder->cancelPrefetch();
     m_prefetchActive = false;
-
-    // decodeNext если следующий кадр последовательный
-    int64_t lastDecoded = m_lastDecodedIdx.load(std::memory_order_acquire);
-    if (lastDecoded > 0 && targetIdx == lastDecoded + 1) {
-        m_decoder->decodeNext();
-    } else {
-        m_decoder->seekAndDecode(pts);
-    }
+    m_decoder->decodeGOP(pts);
 }
 
 void VideoWidget::setContinuousPlay(bool enabled)
@@ -301,27 +294,22 @@ void VideoWidget::setContinuousPlay(bool enabled)
     m_continuousPlay = enabled;
     m_continuousPending = 0;
 
-    if (enabled && !wasEnabled) {
-        // Синхронизируем декодер — только если он не на текущей позиции
-        // (seekTo/seekAndDecode уже мог его поставить)
-        if (m_decoder && m_fileLoaded) {
-            int64_t lastDecoded = m_lastDecodedIdx.load(std::memory_order_acquire);
-            if (lastDecoded != m_currentIdx) {
-                m_decoder->cancelPrefetch();
-                m_prefetchActive = false;
-                m_decoder->seekAndDecode(m_currentPts);
-            }
-        }
+    if (enabled && !wasEnabled && m_decoder && m_fileLoaded) {
+        // Sync декодера: seekAndDecode ставит demuxer на текущую позицию.
+        // m_syncOnly подавляет визуальное обновление — кадр уже на экране.
+        m_syncOnly = true;
+        m_pendingSeekPts = m_currentPts;
+        m_decoder->cancelPrefetch();
+        m_prefetchActive = false;
+        m_decoder->seekAndDecode(m_currentPts);
     }
 }
 
-// Принудительная ресинхронизация (для loop)
 void VideoWidget::forceSyncDecoder(double pts)
 {
     m_continuousPending = 0;
-    m_currentPts = pts;
-    m_currentIdx = static_cast<int64_t>(std::round(pts * m_decoder->fps()));
-    if (m_decoder && m_fileLoaded && m_continuousPlay) {
+    m_pendingSeekPts = pts;
+    if (m_decoder && m_fileLoaded) {
         m_decoder->cancelPrefetch();
         m_prefetchActive = false;
         m_decoder->seekAndDecode(pts);
@@ -335,32 +323,32 @@ void VideoWidget::stepFrame(int delta)
     double fpsVal = m_decoder->fps();
     if (fpsVal <= 0.0) return;
 
-    // Если идёт seek (из ползунка и т.п.) — игнорируем шаги до его завершения.
-    // Это предотвращает дёрганье: decodeNext не отправляется пока
-    // seekAndDecode не завершился и не обновил позицию.
-    if (m_pendingSeekPts >= 0.0)
-        return;
+    // ── Непрерывное воспроизведение ──────────────────────────────────────────
+    if (m_continuousPlay) {
+        // Ждём завершения sync/seek
+        if (m_pendingSeekPts >= 0.0) return;
 
-    // ── Непрерывное воспроизведение вперёд ───────────────────────────────────
-    if (m_continuousPlay && delta == 1) {
-        if (m_continuousPending >= 2) return;
-        m_continuousPending++;
-        m_decoder->decodeNext();
-        return;
-    }
-
-    // ── Непрерывное воспроизведение реверс ────────────────────────────────────
-    if (m_continuousPlay && delta == -1) {
-        if (m_currentPts <= 0.5 / fpsVal) {
-            emit endOfFileReached();
+        if (delta == 1) {
+            if (m_continuousPending >= 2) return;
+            m_continuousPending++;
+            m_decoder->decodeNext();
             return;
         }
-        double newPts = std::max(0.0, m_currentPts - 1.0 / fpsVal);
-        seekTo(newPts);
-        return;
+        if (delta == -1) {
+            if (m_currentPts <= 0.5 / fpsVal) {
+                emit endOfFileReached();
+                return;
+            }
+            double newPts = std::max(0.0, m_currentPts - 1.0 / fpsVal);
+            seekTo(newPts);
+            return;
+        }
     }
 
-    // ── Обычный режим (jog, стрелки) ─────────────────────────────────────────
+    // ── Jog / стрелки (не continuous) ────────────────────────────────────────
+    // Если предыдущий seek ещё в процессе — игнорируем
+    if (m_pendingSeekPts >= 0.0) return;
+
     double newPts = m_currentPts + delta / fpsVal;
     double limit = m_decoder->lastFramePts();
     newPts = std::clamp(newPts, 0.0, limit);
@@ -511,31 +499,49 @@ void VideoWidget::onFileOpened(bool success, const QString& error)
 
 void VideoWidget::onSeekComplete(double pts)
 {
-    m_currentPts = pts;
-    m_currentIdx = static_cast<int64_t>(std::round(pts * m_decoder->fps()));
     m_pendingSeekPts = -1.0;
+
+    if (m_syncOnly) {
+        // Sync только для позиционирования декодера — не меняем отображение
+        m_syncOnly = false;
+        emit seekCompleted();
+        return;
+    }
+
+    // Доверяем декодеру: используем frameIdx который он вычислил
+    int64_t idx = m_lastDecodedIdx.load(std::memory_order_acquire);
+    m_currentPts = pts;
+    m_currentIdx = (idx >= 0) ? idx : static_cast<int64_t>(std::round(pts * m_decoder->fps()));
     emit positionChanged(pts);
+    emit seekCompleted();
     update();
     schedulePrefetch();
 }
 
 void VideoWidget::onGopDecoded(double startPts, double endPts, int frameCount)
 {
-    Q_UNUSED(startPts) Q_UNUSED(endPts) Q_UNUSED(frameCount)
+    Q_UNUSED(startPts) Q_UNUSED(frameCount)
 
+    // GOP декодирован — последний кадр (endPts) ближайший к target.
+    // Обновляем позицию на него.
+    int64_t idx = m_lastDecodedIdx.load(std::memory_order_acquire);
+    m_currentPts = endPts;
+    m_currentIdx = (idx >= 0) ? idx : static_cast<int64_t>(std::round(endPts * m_decoder->fps()));
     m_pendingSeekPts = -1.0;
+
     emit positionChanged(m_currentPts);
+    emit seekCompleted();
     update();
     schedulePrefetch();
 }
 
 void VideoWidget::onNextDecoded(double pts)
 {
+    int64_t idx = m_lastDecodedIdx.load(std::memory_order_acquire);
     m_currentPts = pts;
-    m_currentIdx = static_cast<int64_t>(std::round(pts * m_decoder->fps()));
+    m_currentIdx = (idx >= 0) ? idx : static_cast<int64_t>(std::round(pts * m_decoder->fps()));
     m_pendingSeekPts = -1.0;
 
-    // Уменьшаем счётчик pending для непрерывного воспроизведения
     if (m_continuousPending > 0)
         m_continuousPending--;
 

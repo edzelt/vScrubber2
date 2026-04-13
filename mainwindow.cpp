@@ -39,6 +39,8 @@ MainWindow::MainWindow(QWidget* parent)
             this, &MainWindow::onPositionChanged);
     connect(m_videoWidget, &VideoWidget::endOfFileReached,
             this, &MainWindow::onEndOfFile);
+    connect(m_videoWidget, &VideoWidget::seekCompleted,
+            m_playback, &PlaybackController::resetClock);
 
     // ── Связи: PlaybackController → VideoWidget ──────────────────────────────
     // Шаг кадров: контроллер говорит сколько кадров показать
