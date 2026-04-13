@@ -56,7 +56,7 @@ public:
     // При pause/jog — обычный путь через seekTo().
     void setContinuousPlay(bool enabled);
     bool isContinuousPlay() const { return m_continuousPlay; }
-    void forceSyncDecoder();   // принудительная ресинхронизация (для loop)
+    void forceSyncDecoder(double pts);   // принудительная ресинхронизация (для loop)
 
     // ── GOP навигация (для перемотки по keyframe) ────────────────────────────
     int    gopCount()       const;
@@ -139,8 +139,6 @@ private:
     int64_t      m_lastDisplayedIdx = -1;
 
     // ── Prefetch ─────────────────────────────────────────────────────────────
-    int      m_navDirection    = 0;       // -1 / 0 / +1
-    int64_t  m_prevNavIdx      = -1;
     bool     m_prefetchActive  = false;
 
     // ── Флаги ────────────────────────────────────────────────────────────────

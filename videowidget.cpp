@@ -266,25 +266,12 @@ void VideoWidget::seekTo(double pts)
     double fpsVal = m_decoder->fps();
     int64_t targetIdx = static_cast<int64_t>(std::round(pts * fpsVal));
 
-    // Любой seek сбрасывает очередь непрерывного воспроизведения
     m_continuousPending = 0;
 
-    // Определяем направление навигации
-    if (m_prevNavIdx >= 0 && targetIdx != m_prevNavIdx) {
-        int newDir = (targetIdx > m_prevNavIdx) ? 1 : -1;
-        if (newDir != m_navDirection) {
-            m_decoder->cancelPrefetch();
-            m_prefetchActive = false;
-        }
-        m_navDirection = newDir;
-    }
-    m_prevNavIdx = targetIdx;
-
-    m_currentPts = pts;
-    m_currentIdx = targetIdx;
-
-    // Cache hit — показываем мгновенно
+    // Cache hit — показываем мгновенно, обновляем позицию
     if (m_ringBuffer && m_ringBuffer->lookup(targetIdx)) {
+        m_currentPts = pts;
+        m_currentIdx = targetIdx;
         m_pendingSeekPts = -1.0;
         emit positionChanged(pts);
         update();
@@ -292,7 +279,9 @@ void VideoWidget::seekTo(double pts)
         return;
     }
 
-    // Cache miss — декодируем
+    // Cache miss — запоминаем цель, но НЕ обновляем m_currentPts/m_currentIdx
+    // до прихода реально декодированного кадра (onSeekComplete).
+    // Это предотвращает дёрганье: paintGL продолжает показывать предыдущий кадр.
     m_pendingSeekPts = pts;
     m_decoder->cancelPrefetch();
     m_prefetchActive = false;
@@ -302,7 +291,7 @@ void VideoWidget::seekTo(double pts)
     if (lastDecoded > 0 && targetIdx == lastDecoded + 1) {
         m_decoder->decodeNext();
     } else {
-        m_decoder->decodeGOP(pts);
+        m_decoder->seekAndDecode(pts);
     }
 }
 
@@ -313,23 +302,29 @@ void VideoWidget::setContinuousPlay(bool enabled)
     m_continuousPending = 0;
 
     if (enabled && !wasEnabled) {
-        // Синхронизируем декодер с текущей позицией (только при переходе в continuous)
+        // Синхронизируем декодер — только если он не на текущей позиции
+        // (seekTo/seekAndDecode уже мог его поставить)
         if (m_decoder && m_fileLoaded) {
-            m_decoder->cancelPrefetch();
-            m_prefetchActive = false;
-            m_decoder->seekAndDecode(m_currentPts);
+            int64_t lastDecoded = m_lastDecodedIdx.load(std::memory_order_acquire);
+            if (lastDecoded != m_currentIdx) {
+                m_decoder->cancelPrefetch();
+                m_prefetchActive = false;
+                m_decoder->seekAndDecode(m_currentPts);
+            }
         }
     }
 }
 
 // Принудительная ресинхронизация (для loop)
-void VideoWidget::forceSyncDecoder()
+void VideoWidget::forceSyncDecoder(double pts)
 {
     m_continuousPending = 0;
+    m_currentPts = pts;
+    m_currentIdx = static_cast<int64_t>(std::round(pts * m_decoder->fps()));
     if (m_decoder && m_fileLoaded && m_continuousPlay) {
         m_decoder->cancelPrefetch();
         m_prefetchActive = false;
-        m_decoder->seekAndDecode(m_currentPts);
+        m_decoder->seekAndDecode(pts);
     }
 }
 
@@ -340,48 +335,35 @@ void VideoWidget::stepFrame(int delta)
     double fpsVal = m_decoder->fps();
     if (fpsVal <= 0.0) return;
 
-    double maxPtsVal = maxPts();  // реальный PTS последнего кадра
+    // Если идёт seek (из ползунка и т.п.) — игнорируем шаги до его завершения.
+    // Это предотвращает дёрганье: decodeNext не отправляется пока
+    // seekAndDecode не завершился и не обновил позицию.
+    if (m_pendingSeekPts >= 0.0)
+        return;
 
-    // ── Непрерывное воспроизведение: decodeNext без seek ──────────────────────
+    // ── Непрерывное воспроизведение вперёд ───────────────────────────────────
     if (m_continuousPlay && delta == 1) {
-        // Ограничиваем очередь: максимум 2 pending decodeNext
-        // Конец файла определяется сигналом endOfStream от декодера
-        if (m_continuousPending >= 2)
-            return;
-
+        if (m_continuousPending >= 2) return;
         m_continuousPending++;
         m_decoder->decodeNext();
         return;
     }
 
-    // ── Реверс при непрерывном воспроизведении ───────────────────────────────
+    // ── Непрерывное воспроизведение реверс ────────────────────────────────────
     if (m_continuousPlay && delta == -1) {
-        // Проверяем начало файла
         if (m_currentPts <= 0.5 / fpsVal) {
             emit endOfFileReached();
             return;
         }
-
-        double newPts = m_currentPts - 1.0 / fpsVal;
-        newPts = std::clamp(newPts, 0.0, maxPtsVal);
+        double newPts = std::max(0.0, m_currentPts - 1.0 / fpsVal);
         seekTo(newPts);
         return;
     }
 
-    // ── Обычный режим (jog, shuttle, стрелки) ────────────────────────────────
-    if (m_pendingSeekPts >= 0.0) {
-        double nextPts = m_pendingSeekPts + delta / fpsVal;
-        nextPts = std::clamp(nextPts, 0.0, maxPtsVal);
-        if (std::abs(nextPts - m_currentPts) > 8.0 / fpsVal)
-            return;
-        m_pendingSeekPts = nextPts;
-        m_currentPts = nextPts;
-        m_currentIdx = static_cast<int64_t>(std::round(nextPts * fpsVal));
-        return;
-    }
-
+    // ── Обычный режим (jog, стрелки) ─────────────────────────────────────────
     double newPts = m_currentPts + delta / fpsVal;
-    newPts = std::clamp(newPts, 0.0, maxPtsVal);
+    double limit = m_decoder->lastFramePts();
+    newPts = std::clamp(newPts, 0.0, limit);
     seekTo(newPts);
 }
 
@@ -470,7 +452,7 @@ void VideoWidget::onFrameDecoded(const DecodedFrame& frame)
     frameCopy.data[0] = dataCopy->data();
     frameCopy.data[1] = dataCopy->data() + ySize;
 
-    // TODO: Заменить glTexSubImage2D на PBO для асинхронного upload на 4K
+    // NV12 данные загружаются через PBO в FrameRingBuffer::store()
     QMetaObject::invokeMethod(this, [this, frameCopy, dataCopy]() {
         if (!m_ringBuffer || !m_initialized) return;
         makeCurrent();
@@ -534,6 +516,7 @@ void VideoWidget::onSeekComplete(double pts)
     m_pendingSeekPts = -1.0;
     emit positionChanged(pts);
     update();
+    schedulePrefetch();
 }
 
 void VideoWidget::onGopDecoded(double startPts, double endPts, int frameCount)

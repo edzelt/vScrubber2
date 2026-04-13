@@ -4,7 +4,6 @@
 #include <QMainWindow>
 #include <QMenuBar>
 #include <QApplication>
-#include <QDebug>
 #include <cmath>
 
 InputController::InputController(PlaybackController* playback, QObject* parent)

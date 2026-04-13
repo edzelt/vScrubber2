@@ -17,56 +17,44 @@ struct NV12Textures {
     explicit operator bool() const { return isValid(); }
 };
 
-// ── Кольцевой GPU-буфер декодированных кадров (NV12) ─────────────────────────
+// ── Кольцевой GPU-буфер декодированных кадров (NV12) + PBO upload ────────────
 //
 // Хранит NV12 текстуры на GPU: Y (GL_R8) + UV (GL_RG8 чередующийся).
-// Конвертация YUV → RGB выполняется шейдером при отрисовке.
+// Загрузка CPU → GPU через PBO (Pixel Buffer Objects) — асинхронный DMA.
 //
-// VRAM на кадр: width × height × 1.5 байт (вместо × 4 для RGBA).
-// Для 1080p: 300 кадров × 3МБ ≈ 0.9ГБ VRAM.
-// Для 4K:    300 кадров × 12МБ ≈ 3.6ГБ VRAM.
+// PBO ping-pong: два PBO чередуются. Пока GPU передаёт данные из PBO[0],
+// CPU заполняет PBO[1]. glTexSubImage2D из PBO возвращается мгновенно.
 //
-// Thread safety: store() и lookup() защищены мьютексом.
-// store() вызывается из main потока (через QueuedConnection),
-// lookup() из render потока.
+// VRAM на кадр: width × height × 1.5 байт (NV12).
+// PBO: 2 × (width × height × 1.5) байт в системной DMA-памяти.
+//
 class FrameRingBuffer : protected QOpenGLFunctions_4_5_Core
 {
 public:
     FrameRingBuffer() = default;
     ~FrameRingBuffer() { destroy(); }
 
-    // ── Инициализация (вызывать в GL контексте) ──────────────────────────────
     void init(int maxFrames = 300);
     void destroy();
     void clear();
 
-    // ── Размер кадра (при изменении — сброс всех текстур) ────────────────────
     void setFrameSize(int w, int h);
     int frameW() const { return m_frameW; }
     int frameH() const { return m_frameH; }
 
-    // ── Основные операции ────────────────────────────────────────────────────
-
-    // Сохранить декодированный кадр (NV12 данные из CPU → GL текстуры).
-    // Thread-safe. Вызывается из main потока.
+    // Сохранить кадр: CPU NV12 → PBO → GL текстуры (асинхронно)
     void store(const DecodedFrame& frame);
 
-    // Получить пару GL текстур для кадра. Возвращает {0,0} при промахе.
-    // При попадании обновляет age (LRU touch) — защищает от вытеснения.
-    // Thread-safe. Вызывается из render потока.
+    // Получить текстуры для кадра (LRU touch)
     NV12Textures lookup(int64_t frameIdx);
     NV12Textures lookup(double pts, double fps);
 
-    // Быстрая проверка наличия кадра в кэше (без touch).
-    // Thread-safe. Вызывается из decode потока для cacheCheck.
+    // Проверка наличия (без touch)
     bool contains(int64_t frameIdx) const;
 
-    // ── Информация ───────────────────────────────────────────────────────────
     int  count()    const;
     int  capacity() const { return m_maxFrames; }
     bool isInitialized() const { return m_initialized; }
-
-    // Проверить есть ли непрерывный диапазон кадров [from..to] в буфере
     bool hasRange(int64_t fromIdx, int64_t toIdx) const;
 
 private:
@@ -88,4 +76,11 @@ private:
     int      m_frameH      = 0;
     uint64_t m_ageCounter  = 0;
     bool     m_initialized = false;
+
+    // ── PBO ping-pong ────────────────────────────────────────────────────────
+    static constexpr int PBO_COUNT = 2;
+    GLuint  m_pbo[PBO_COUNT] = {};     // PBO для Y+UV данных
+    int     m_pboIndex       = 0;      // текущий PBO (0 или 1)
+    size_t  m_pboSize        = 0;      // размер каждого PBO в байтах
+    GLsync  m_pboFence       = nullptr; // fence для ожидания завершения предыдущего upload
 };

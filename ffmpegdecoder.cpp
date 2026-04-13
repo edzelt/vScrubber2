@@ -357,28 +357,58 @@ bool FFmpegDecoder::doSeekAndDecode(double pts)
     flushDecoder();
 
     AVFrame* frame = av_frame_alloc();
-    if (!frame) return false;
+    AVFrame* bestFrame = av_frame_alloc();
+    if (!frame || !bestFrame) {
+        av_frame_free(&frame);
+        av_frame_free(&bestFrame);
+        return false;
+    }
 
-    bool found = false;
+    // Декодируем от keyframe, ищем кадр с PTS ближайшим к target.
+    // B-frames: декодер выдаёт кадры в display order, но после flush
+    // первые кадры могут прыгать. Декодируем до target + 3 кадра запаса.
     double targetPts = pts;
+    double bestPts = -1.0;
+    double bestDiff = 1e9;
+    int framesAfterTarget = 0;
 
-    // Декодируем кадры от keyframe до нужного PTS
     while (decodeNextPacket(frame)) {
         double fpts = framePts(frame);
 
-        // Нашли кадр ≥ target (с точностью до полкадра)
-        if (fpts >= targetPts - 0.5 / m_fps) {
-            m_lastDecodedPts = fpts;
-            m_demuxerContinuous = true;
-            deliverFrame(frame);
-            emit seekComplete(fpts);
-            found = true;
-            break;
+        if (fpts >= 0.0) {
+            double diff = std::abs(fpts - targetPts);
+            if (diff < bestDiff) {
+                bestDiff = diff;
+                bestPts = fpts;
+                av_frame_unref(bestFrame);
+                av_frame_move_ref(bestFrame, frame);
+            } else {
+                av_frame_unref(frame);
+            }
+
+            if (fpts >= targetPts)
+                framesAfterTarget++;
+
+            // 3 кадра после target — reorder buffer исчерпан
+            if (framesAfterTarget >= 3) break;
+            // Точное попадание
+            if (bestDiff < 0.001) break;
+        } else {
+            av_frame_unref(frame);
         }
-        av_frame_unref(frame);
+    }
+
+    bool found = false;
+    if (bestPts >= 0.0) {
+        m_lastDecodedPts = bestPts;
+        m_demuxerContinuous = true;
+        deliverFrame(bestFrame);
+        emit seekComplete(bestPts);
+        found = true;
     }
 
     av_frame_free(&frame);
+    av_frame_free(&bestFrame);
     return found;
 }
 

@@ -82,12 +82,7 @@ MainWindow::MainWindow(QWidget* parent)
     if (tp) {
         connect(tp, &TransportPanel::seekRequested,
                 this, [this](double pts) {
-                    bool wasPlaying = m_playback->isPlaying();
-                    // Обновляем позицию
                     m_videoWidget->seekTo(pts);
-                    // Ресинхронизируем декодер если играет
-                    if (wasPlaying)
-                        m_videoWidget->forceSyncDecoder();
                 });
         connect(tp, &TransportPanel::fileSelected,
                 this, [this](const QString& path) {
@@ -267,7 +262,7 @@ void MainWindow::onEndOfFile()
         // Только Loop: зацикливаем текущий файл
         double targetPts = (spd > 0.0) ? 0.0 : m_videoWidget->maxPts();
         m_videoWidget->seekTo(targetPts);
-        m_videoWidget->forceSyncDecoder();
+        m_videoWidget->forceSyncDecoder(targetPts);
     } else if (loopDir || loopFile) {
         // Dir (без Loop): проиграть до конца каталога, остановиться
         // Dir + Loop: зациклить весь каталог

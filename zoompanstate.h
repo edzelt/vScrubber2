@@ -36,8 +36,8 @@ public:
 
     // ── Ограничения ──────────────────────────────────────────────────────────
     static constexpr double MIN_ZOOM  =  1.0;
-    static constexpr double MAX_ZOOM  = 16.0;
-    static constexpr double ZOOM_STEP =  1.15;
+    static constexpr double MAX_ZOOM  =  3.0;
+    static constexpr double ZOOM_STEP =  1.1;   // ~10% за щелчок колеса
 
 private:
     void clampPan();

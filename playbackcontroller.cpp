@@ -1,5 +1,4 @@
 #include "playbackcontroller.h"
-#include <QDebug>
 #include <cmath>
 
 PlaybackController::PlaybackController(QObject* parent)
@@ -84,10 +83,10 @@ void PlaybackController::setSpeed(double speed)
     m_speed = newSpeed;
     m_frameDebt = 0.0;  // сброс накопления при смене скорости
 
-    // Обновляем режим непрерывного воспроизведения:
-    // вперёд = continuous, реверс или 0 = обычный seekTo
+    // Обновляем режим непрерывного воспроизведения
     if (m_state == Playing) {
-        emit continuousPlayChanged(m_speed > 0.0);
+        bool shouldBeContinuous = (m_speed > 0.0);
+        emit continuousPlayChanged(shouldBeContinuous);
     }
 
     emit speedChanged(m_speed);
